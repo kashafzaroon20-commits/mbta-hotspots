@@ -1,1 +1,255 @@
+import pandas as pd
+import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+
+# ── 1. LOAD FILES ─────────────────────────────────────────────
+df    = pd.read_csv("all_seasons_clean.csv")
+stops = pd.read_csv("stops.txt")
+
+df["stop_id"]    = df["stop_id"].astype(str)
+stops["stop_id"] = stops["stop_id"].astype(str)
+
+print(f"Loaded: {len(df):,} rows")
+print(f"Columns: {df.columns.tolist()}")
+
+# ── 2. JOIN LAT/LON ───────────────────────────────────────────
+df = df.merge(
+    stops[["stop_id", "stop_lat", "stop_lon"]],
+    on="stop_id", how="left"
+)
+df = df.dropna(subset=["stop_lat", "stop_lon", "score"])
+print(f"Stops with coordinates: {len(df):,}")
+
+# ── 3. CONVERT MEAN DELAY TO SECONDS ──────────────────────────
+df["mean_delay_sec"] = df["mean_delay_min"] * 60
+
+# ── 4. SCALE FEATURES ─────────────────────────────────────────
+features = df[["stop_lat", "stop_lon", "mean_delay_sec", "pct_late", "score"]]
+scaler   = StandardScaler()
+f_scaled = scaler.fit_transform(features)
+
+# ── 5. ELBOW METHOD ───────────────────────────────────────────
+print("\nRunning elbow method...")
+inertias = []
+k_range  = range(2, 15)
+
+for k in k_range:
+    km = KMeans(n_clusters=k, random_state=42, n_init=10)
+    km.fit(f_scaled)
+    inertias.append(km.inertia_)
+    print(f"k={k}: inertia={km.inertia_:.1f}")
+
+# Plot and save elbow chart
+plt.figure(figsize=(8, 4))
+plt.plot(list(k_range), inertias, marker='o', color='steelblue')
+plt.xlabel("Number of clusters (k)")
+plt.ylabel("Inertia")
+plt.title("Elbow method — all seasons combined")
+plt.xticks(list(k_range))
+plt.tight_layout()
+plt.savefig("elbow_chart.png", dpi=150)
+plt.show()
+print("\nElbow chart saved as elbow_chart.png")
+
+# ── 6. SET K BASED ON ELBOW ───────────────────────────────────
+# Change this number based on the elbow chart output
+K = 6
+
+# ── 7. K-MEANS ────────────────────────────────────────────────
+print(f"\nRunning K-means with k={K}...")
+km = KMeans(n_clusters=K, random_state=42, n_init=10)
+df["cluster"] = km.fit_predict(f_scaled)
+
+# Label by severity
+cluster_means = df.groupby("cluster")["score"].mean().sort_values(ascending=False)
+labels        = ["Severe", "High", "Moderate-High", "Moderate", "Low-Moderate", "Low"][:K]
+label_map     = {c: l for c, l in zip(cluster_means.index, labels)}
+df["cluster_label"] = df["cluster"].map(label_map)
+
+print("\nCluster summary:")
+print(df.groupby("cluster_label").agg(
+    mean_delay_min=("mean_delay_min", "mean"),
+    stop_count=("stop_id", "count"),
+    pct_late_avg=("pct_late", "mean"),
+    avg_income=("median_household_income", "mean")
+).round(2))
+
+# ── 8. SAVE CSV ───────────────────────────────────────────────
+df.to_csv("all_seasons_clustered.csv", index=False)
+print("\nSaved: all_seasons_clustered.csv")
+
+# ── 9. BUILD INTERACTIVE MAP WITH FILTERS ─────────────────────
+import json
+
+color_map = {
+    "Severe":        "#E24B4A",
+    "High":          "#EF9F27",
+    "Moderate-High": "#F0997B",
+    "Moderate":      "#85B7EB",
+    "Low-Moderate":  "#378ADD",
+    "Low":           "#639922"
+}
+
+# Build records for JS
+records = []
+for _, row in df.iterrows():
+    records.append({
+        "lat":          float(row["stop_lat"]),
+        "lon":          float(row["stop_lon"]),
+        "stop_name":    str(row.get("stop_name", "")),
+        "route_id":     str(row["route_id"]),
+        "direction_id": str(row["direction_id"]),
+        "time_of_day":  str(row["time_of_day"]),
+        "season":       str(row["season"]).lower(),
+        "mean_delay":   round(float(row["mean_delay_min"]), 1),
+        "pct_late":     round(float(row["pct_late"]), 1),
+        "neighborhood": str(row.get("neighborhood", "")),
+        "income":       str(row.get("median_household_income", "")),
+        "cluster":      str(row["cluster_label"]),
+        "color":        color_map.get(str(row["cluster_label"]), "#888")
+    })
+
+time_slots = sorted(df["time_of_day"].dropna().unique().tolist())
+seasons    = sorted(df["season"].dropna().str.lower().unique().tolist())
+
+html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>MBTA Bus Delay Hotspots</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  * {{ box-sizing:border-box; margin:0; padding:0; }}
+  body {{ font-family: Arial, sans-serif; }}
+  #map {{ height:100vh; width:100%; }}
+  #controls {{
+    position:absolute; top:10px; right:10px; z-index:1000;
+    background:white; padding:16px; border-radius:10px;
+    box-shadow:0 2px 12px rgba(0,0,0,0.2); width:240px;
+  }}
+  #controls h3 {{ font-size:14px; font-weight:bold; color:#222; margin-bottom:12px; text-align:center; }}
+  .season-tabs {{ display:flex; gap:4px; margin-bottom:12px; flex-wrap:wrap; }}
+  .season-tab {{
+    flex:1; padding:6px 4px; border:1px solid #ddd;
+    border-radius:6px; background:#f5f5f5;
+    font-size:11px; cursor:pointer; text-align:center;
+    text-transform:capitalize; color:#555; min-width:50px;
+  }}
+  .season-tab.active {{ background:#378ADD; color:white; border-color:#378ADD; }}
+  label {{ display:block; font-size:11px; color:#666; margin-bottom:3px; }}
+  select {{ width:100%; padding:6px; margin-bottom:10px; border:1px solid #ddd; border-radius:6px; font-size:12px; color:#333; }}
+  #stats {{ font-size:11px; color:#555; margin-bottom:10px; padding:6px; background:#f9f9f9; border-radius:6px; text-align:center; }}
+  #legend {{ border-top:1px solid #eee; padding-top:10px; }}
+  #legend h4 {{ font-size:11px; color:#444; margin-bottom:6px; }}
+  .legend-item {{ display:flex; align-items:center; gap:8px; margin-bottom:4px; font-size:11px; color:#333; }}
+  .legend-dot {{ width:12px; height:12px; border-radius:50%; flex-shrink:0; }}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="controls">
+  <h3>MBTA Delay Hotspots</h3>
+  <div class="season-tabs">
+    <div class="season-tab active" onclick="setSeason('all')">All</div>
+    {''.join(f'<div class="season-tab" onclick="setSeason(\'{s}\')">{s.capitalize()}</div>' for s in seasons)}
+  </div>
+  <label>Time of day</label>
+  <select id="time-select" onchange="updateMap()">
+    <option value="all">All times</option>
+    {''.join(f'<option value="{t}">{t.replace("_"," ")}</option>' for t in time_slots)}
+  </select>
+  <label>Severity</label>
+  <select id="cluster-select" onchange="updateMap()">
+    <option value="all">All severities</option>
+    <option value="Severe">Severe</option>
+    <option value="High">High</option>
+    <option value="Moderate-High">Moderate-High</option>
+    <option value="Moderate">Moderate</option>
+    <option value="Low-Moderate">Low-Moderate</option>
+    <option value="Low">Low</option>
+  </select>
+  <div id="stats">Loading...</div>
+  <div id="legend">
+    <h4>Severity</h4>
+    <div class="legend-item"><div class="legend-dot" style="background:#E24B4A"></div>Severe</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#EF9F27"></div>High</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#F0997B"></div>Moderate-High</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#85B7EB"></div>Moderate</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#378ADD"></div>Low-Moderate</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#639922"></div>Low</div>
+  </div>
+</div>
+<script>
+const data = {json.dumps(records)};
+const map  = L.map('map').setView([42.31, -71.08], 12);
+L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+  attribution: '© OpenStreetMap contributors'
+}}).addTo(map);
+
+let markers       = [];
+let currentSeason = 'all';
+
+function setSeason(s) {{
+  currentSeason = s;
+  document.querySelectorAll('.season-tab').forEach(t => {{
+    t.classList.toggle('active',
+      t.textContent.toLowerCase() === s ||
+      (s === 'all' && t.textContent === 'All'));
+  }});
+  updateMap();
+}}
+
+function updateMap() {{
+  const time    = document.getElementById('time-select').value;
+  const cluster = document.getElementById('cluster-select').value;
+
+  markers.forEach(m => map.removeLayer(m));
+  markers = [];
+
+  const filtered = data.filter(d =>
+    (currentSeason === 'all' || d.season     === currentSeason) &&
+    (time          === 'all' || d.time_of_day === time) &&
+    (cluster       === 'all' || d.cluster     === cluster)
+  );
+
+  const order = {{'Severe':6,'High':5,'Moderate-High':4,'Moderate':3,'Low-Moderate':2,'Low':1}};
+  filtered.sort((a,b) => (order[a.cluster]||0) - (order[b.cluster]||0));
+
+  filtered.forEach(d => {{
+    const m = L.circleMarker([d.lat, d.lon], {{
+      radius:6, color:d.color, fillColor:d.color,
+      fillOpacity:0.85, weight:1
+    }}).bindPopup(
+      `<b>${{d.stop_name}}</b><br>
+       <b>Route:</b> ${{d.route_id}} ${{d.direction_id}}<br>
+       <b>Neighbourhood:</b> ${{d.neighborhood}}<br>
+       <b>Time:</b> ${{d.time_of_day.replace(/_/g,' ')}}<br>
+       <b>Season:</b> ${{d.season}}<br>
+       <b>Avg delay:</b> ${{d.mean_delay}} min<br>
+       <b>% Late:</b> ${{d.pct_late}}%<br>
+       <b>Median income:</b> ${{d.income}}<br>
+       <b>Severity:</b> ${{d.cluster}}`
+    );
+    m.addTo(map);
+    markers.push(m);
+  }});
+
+  const label = currentSeason === 'all' ? 'All seasons' : currentSeason.charAt(0).toUpperCase() + currentSeason.slice(1);
+  document.getElementById('stats').innerHTML =
+    `<b>${{label}}</b> — showing <b>${{filtered.length}}</b> stops`;
+}}
+
+updateMap();
+</script>
+</body>
+</html>"""
+
+with open("all_seasons_hotspots.html", "w") as f:
+    f.write(html)
+
+print("Map saved: all_seasons_hotspots.html")
+print("Open it in your browser to view!")
 
